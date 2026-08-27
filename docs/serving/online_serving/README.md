@@ -182,6 +182,7 @@ For further details on Weight Transfer, please refer to [this page](../../traini
 - `/update_weight_version` - Set the weight version without updating model weights
 - `/weight_info` - Get the latest committed weight version
 - `/get_world_size` - Get distributed world size
+- `/reload_weights` - Reload weights from disk in place, fully or [partially](../../training/partial_weight_reload.md) (can alter model behavior)
 
 ### Collective RPC
 

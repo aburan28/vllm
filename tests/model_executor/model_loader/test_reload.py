@@ -30,12 +30,14 @@ from vllm.model_executor.model_loader.reload.meta import (
     restore_layer_on_meta,
     to_meta_tensor,
 )
+from vllm.model_executor.model_loader.reload.partial import resolve_touched_modules
 from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
 from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader,
     default_weight_loader,
 )
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.platforms import current_platform
 
 
@@ -1074,3 +1076,137 @@ def test_online_quantize_reload(
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert add_perp < mul_perp
+
+
+class _TwoLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = torch.nn.Linear(2, 2, bias=False)
+        self.second = torch.nn.Linear(2, 2, bias=False)
+
+
+def _subtree(module: torch.nn.Module) -> set[torch.nn.Module]:
+    return set(module.modules())
+
+
+def test_partial_reload_brackets_only_selected_modules():
+    """Modules outside the bracketed set keep their tensors untouched."""
+    model = _TwoLinearModel()
+    untouched_weight = model.second.weight
+    untouched_values = untouched_weight.detach().clone()
+    original_storage_ptr = model.first.weight.untyped_storage().data_ptr()
+    loaded_weight = torch.full((2, 2), 7.0)
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model, modules=_subtree(model.first))
+
+    assert model.first.weight.is_meta
+    assert model.second.weight is untouched_weight
+
+    model.first.weight.weight_loader(model.first.weight, loaded_weight)
+    rolled_back = finalize_layerwise_reload(
+        model, Mock(), modules=_subtree(model.first), partial=True
+    )
+
+    assert rolled_back == []
+    assert torch.equal(model.first.weight, loaded_weight)
+    assert model.first.weight.untyped_storage().data_ptr() == original_storage_ptr
+    assert model.second.weight is untouched_weight
+    assert torch.equal(model.second.weight, untouched_values)
+
+
+def test_partial_reload_restores_bracketed_but_unloaded_layer():
+    """A bracketed layer receiving no weights is restored silently."""
+    model = _TwoLinearModel()
+    original_values = model.second.weight.detach().clone()
+    modules = _subtree(model.first) | _subtree(model.second)
+    loaded_weight = torch.full((2, 2), 7.0)
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model, modules=modules)
+    model.first.weight.weight_loader(model.first.weight, loaded_weight)
+    rolled_back = finalize_layerwise_reload(
+        model, Mock(), modules=modules, partial=True
+    )
+
+    assert rolled_back == []
+    assert torch.equal(model.first.weight, loaded_weight)
+    assert torch.equal(model.second.weight, original_values)
+
+
+def test_partial_reload_rolls_back_incomplete_layer():
+    """A layer receiving only some of its weights rolls back to its old ones."""
+    layer = torch.nn.Linear(2, 2, bias=True)
+    model = torch.nn.Sequential(layer)
+    original_weight = layer.weight.detach().clone()
+    original_bias = layer.bias.detach().clone()
+    loaded_weight = torch.full((2, 2), 7.0)
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model, modules=_subtree(model))
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+    rolled_back = finalize_layerwise_reload(
+        model, Mock(), modules=_subtree(model), partial=True
+    )
+
+    assert rolled_back == [layer]
+    assert torch.equal(layer.weight, original_weight)
+    assert torch.equal(layer.bias, original_bias)
+
+
+class _StackedProjModel(torch.nn.Module):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            ".q_proj.": (".qkv_proj.", "q"),
+            ".k_proj.": (".qkv_proj.", "k"),
+            ".v_proj.": (".qkv_proj.", "v"),
+        },
+        orig_to_new_substr={"rotary_emb.inv_freq": None},
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList(
+            [torch.nn.ModuleDict({"self_attn": _AttnBlock()}) for _ in range(2)]
+        )
+        self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+
+class _AttnBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.qkv_proj = torch.nn.Linear(2, 6, bias=False)
+        self.o_proj = torch.nn.Linear(2, 2, bias=False)
+
+
+def test_resolve_touched_modules_stacked_mapper():
+    """Stacked renames resolve to the exact target module, not its parent."""
+    model = _StackedProjModel()
+    touched = resolve_touched_modules(model, ["model.layers.0.self_attn.q_proj.weight"])
+
+    assert touched == {model.model.layers[0]["self_attn"].qkv_proj}
+
+
+def test_resolve_touched_modules_prefix_subtree():
+    """Unmapped names resolve to the deepest enclosing module's subtree."""
+    model = _StackedProjModel()
+    touched = resolve_touched_modules(
+        model, ["model.layers.1.self_attn.unknown_proj.weight", "lm_head.weight"]
+    )
+
+    attn = model.model.layers[1]["self_attn"]
+    assert touched == {attn, attn.qkv_proj, attn.o_proj, model.lm_head}
+
+
+def test_resolve_touched_modules_dropped_and_unresolved_names():
+    """Mapper-dropped names are excluded; unresolvable names raise."""
+    model = _StackedProjModel()
+
+    assert (
+        resolve_touched_modules(model, ["model.layers.0.self_attn.rotary_emb.inv_freq"])
+        == set()
+    )
+
+    with pytest.raises(ValueError, match="nonexistent.weight"):
+        resolve_touched_modules(model, ["nonexistent.weight"])

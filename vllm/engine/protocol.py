@@ -279,3 +279,12 @@ class EngineClient(ABC):
     async def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
         raise NotImplementedError
+
+    async def reload_weights(
+        self,
+        weights_path: str | None = None,
+        weight_name_prefixes: list[str] | None = None,
+        weight_version: str | None = None,
+    ) -> None:
+        """Reload model weights in place from disk, fully or partially."""
+        raise NotImplementedError

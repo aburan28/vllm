@@ -211,6 +211,54 @@ async def finish_weight_update(
     return JSONResponse(content={"message": "Weight update finished"})
 
 
+@router.post("/reload_weights")
+async def reload_weights(
+    raw_request: Request,
+    weights_path: Annotated[str | None, Body(embed=True)] = None,
+    weight_name_prefixes: Annotated[list[str] | None, Body(embed=True)] = None,
+    weight_version: Annotated[str | None, Body(embed=True)] = None,
+) -> JSONResponse:
+    """Reload model weights in place from disk, fully or partially.
+
+    Pause generation (``POST /pause``) before reloading and resume after.
+
+    Args:
+        weights_path: Checkpoint to load from; defaults to the engine's
+            current model path. For a partial reload this may be a delta
+            checkpoint holding just the changed tensors.
+        weight_name_prefixes: If provided, perform a partial reload of only
+            the weights whose checkpoint name starts with one of the prefixes
+            (pass ``[""]`` to load every tensor found at ``weights_path``);
+            only the touched modules are re-processed. If omitted, all
+            weights are reloaded.
+        weight_version: Weight version to set after a successful reload.
+    """
+
+    engine = engine_client(raw_request)
+
+    try:
+        await engine.reload_weights(
+            weights_path=weights_path,
+            weight_name_prefixes=weight_name_prefixes,
+            weight_version=weight_version,
+        )
+        return JSONResponse(
+            content={"status": "reloaded"},
+            status_code=HTTPStatus.OK.value,
+        )
+    except ValueError as err:
+        return JSONResponse(
+            content={"error": str(err)},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as err:  # pragma: no cover - defensive
+        logger.exception("Failed to reload weights")
+        return JSONResponse(
+            content={"error": f"Failed to reload weights: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
 @router.post("/update_weight_version")
 async def update_weight_version(
     raw_request: Request,

@@ -906,6 +906,35 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         """Return the latest committed weight version."""
         return self.llm_engine.get_weight_version()
 
+    def reload_weights(
+        self,
+        weights_path: str | None = None,
+        weight_name_prefixes: list[str] | None = None,
+        weight_version: str | None = None,
+    ) -> None:
+        """
+        Reload model weights in place from disk without restarting the engine.
+
+        Args:
+            weights_path: checkpoint to load from; defaults to the engine's
+                current model path. For a partial reload this may be a delta
+                checkpoint holding just the changed tensors.
+            weight_name_prefixes: if provided, perform a partial reload of
+                only the weights whose checkpoint name starts with one of the
+                prefixes (pass `[""]` to load every tensor found at
+                `weights_path`); only the touched modules are re-processed.
+                If None, all weights are reloaded.
+            weight_version: weight version to set after a successful reload.
+        """
+        kwargs: dict[str, Any] = {}
+        if weights_path is not None:
+            kwargs["weights_path"] = weights_path
+        if weight_name_prefixes is not None:
+            kwargs["weight_name_prefixes"] = weight_name_prefixes
+        self.llm_engine.collective_rpc("reload_weights", kwargs=kwargs)
+        if weight_version is not None:
+            self.llm_engine.set_weight_version(weight_version)
+
     def __repr__(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
         # Cache the result to avoid repeated collective_rpc calls
