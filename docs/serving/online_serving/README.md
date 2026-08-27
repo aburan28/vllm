@@ -184,6 +184,10 @@ For further details on Weight Transfer, please refer to [this page](../../traini
 - `/get_world_size` - Get distributed world size
 - `/reload_weights` - Reload weights from disk in place, fully or [partially](../../training/partial_weight_reload.md) (can alter model behavior)
 
+### Engine Args APIs
+
+- `/update_engine_args` - Hot-update allowlisted engine args (currently the scheduler knobs `max_num_seqs`, `max_num_batched_tokens`, `long_prefill_token_threshold`) without restarting the server. Capacity fields may only be lowered or restored, never raised past their startup values.
+
 ### Collective RPC
 
 - `/collective_rpc` - Execute arbitrary RPC methods on the engine (extremely dangerous)

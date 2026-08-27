@@ -288,3 +288,7 @@ class EngineClient(ABC):
     ) -> None:
         """Reload model weights in place from disk, fully or partially."""
         raise NotImplementedError
+
+    async def update_engine_args(self, overrides: dict) -> dict:
+        """Hot-update allowlisted engine args at runtime."""
+        raise NotImplementedError

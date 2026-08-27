@@ -69,6 +69,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# Scheduler config fields updatable at runtime via `update_config`. A field is
+# admitted only when its readers see the new value: either every read goes
+# through `scheduler_config` live, or `update_config` refreshes the derived
+# state.
+HOT_UPDATABLE_SCHEDULER_CONFIG = frozenset(
+    {
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "long_prefill_token_threshold",
+    }
+)
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -115,13 +127,14 @@ class Scheduler(SchedulerInterface):
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
 
-        # Scheduling constraints.
-        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
-        self.max_num_scheduled_tokens = (
-            self.scheduler_config.max_num_scheduled_tokens
-            if self.scheduler_config.max_num_scheduled_tokens is not None
-            else self.scheduler_config.max_num_batched_tokens
+        # Scheduling constraints. The startup values bound later hot updates
+        # via update_config, since worker-side buffers were sized by them.
+        self.startup_max_num_seqs = self.scheduler_config.max_num_seqs
+        self.startup_max_num_batched_tokens = (
+            self.scheduler_config.max_num_batched_tokens
         )
+        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_scheduled_tokens = self._compute_max_num_scheduled_tokens()
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -2565,6 +2578,81 @@ class Scheduler(SchedulerInterface):
                 and self.ec_connector.has_pending_push_work()
             )
         )
+
+    def _compute_max_num_scheduled_tokens(self) -> int:
+        return (
+            self.scheduler_config.max_num_scheduled_tokens
+            if self.scheduler_config.max_num_scheduled_tokens is not None
+            else self.scheduler_config.max_num_batched_tokens
+        )
+
+    def update_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Hot-update allowlisted scheduler config fields at runtime.
+
+        Capacity fields may only be lowered or restored, never raised past
+        their startup values: worker-side buffers were sized by those at
+        startup. Runs on the engine core loop, so updates are serialized
+        with scheduling steps.
+
+        Returns:
+            the applied fields and their effective values
+
+        Raises:
+            ValueError: on an unknown field or an invalid value; nothing is
+                applied in that case.
+        """
+        for key, value in overrides.items():
+            if key not in HOT_UPDATABLE_SCHEDULER_CONFIG:
+                raise ValueError(
+                    f"Cannot hot-update scheduler config field {key!r}. "
+                    f"Updatable fields: {sorted(HOT_UPDATABLE_SCHEDULER_CONFIG)}"
+                )
+            if key == "max_num_seqs" and not (
+                isinstance(value, int) and 1 <= value <= self.startup_max_num_seqs
+            ):
+                raise ValueError(
+                    f"max_num_seqs must be an integer in "
+                    f"[1, {self.startup_max_num_seqs}] (the startup value), "
+                    f"got {value}"
+                )
+            if key == "max_num_batched_tokens":
+                if not (
+                    isinstance(value, int)
+                    and 1 <= value <= self.startup_max_num_batched_tokens
+                ):
+                    raise ValueError(
+                        f"max_num_batched_tokens must be an integer in "
+                        f"[1, {self.startup_max_num_batched_tokens}] (the "
+                        f"startup value), got {value}"
+                    )
+                if (
+                    not self.scheduler_config.enable_chunked_prefill
+                    and value < self.max_model_len
+                ):
+                    raise ValueError(
+                        f"max_num_batched_tokens ({value}) must be >= "
+                        f"max_model_len ({self.max_model_len}) when chunked "
+                        "prefill is disabled, or long prompts can never be "
+                        "scheduled"
+                    )
+            if key == "long_prefill_token_threshold" and not (
+                isinstance(value, int) and value >= 0
+            ):
+                raise ValueError(
+                    f"long_prefill_token_threshold must be a non-negative "
+                    f"integer, got {value}"
+                )
+
+        for key, value in overrides.items():
+            setattr(self.scheduler_config, key, value)
+        if "max_num_seqs" in overrides:
+            self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        if "max_num_batched_tokens" in overrides:
+            self.max_num_scheduled_tokens = self._compute_max_num_scheduled_tokens()
+
+        applied = {key: getattr(self.scheduler_config, key) for key in overrides}
+        logger.info("Scheduler config hot-updated: %s", applied)
+        return applied
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

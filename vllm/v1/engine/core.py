@@ -985,6 +985,10 @@ class EngineCore:
         """Return the latest committed weight version."""
         return self._weight_version
 
+    def update_scheduler_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Hot-update allowlisted scheduler config fields at runtime."""
+        return self.scheduler.update_config(overrides)
+
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 

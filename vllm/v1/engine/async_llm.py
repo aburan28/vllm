@@ -1183,6 +1183,20 @@ class AsyncLLM(EngineClient):
         """Return the latest committed weight version."""
         return await self.engine_core.get_weight_version_async()
 
+    async def update_engine_args(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """
+        Hot-update allowlisted engine args at runtime.
+
+        Currently covers scheduler knobs (`max_num_seqs`,
+        `max_num_batched_tokens`, `long_prefill_token_threshold`); capacity
+        fields may only be lowered or restored, never raised past their
+        startup values.
+
+        Returns:
+            the applied fields and their effective values
+        """
+        return await self.engine_core.update_scheduler_config_async(overrides)
+
     async def reload_weights(
         self,
         weights_path: str | None = None,

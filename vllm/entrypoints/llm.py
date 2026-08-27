@@ -935,6 +935,20 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         if weight_version is not None:
             self.llm_engine.set_weight_version(weight_version)
 
+    def update_engine_args(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """
+        Hot-update allowlisted engine args at runtime.
+
+        Currently covers scheduler knobs (`max_num_seqs`,
+        `max_num_batched_tokens`, `long_prefill_token_threshold`); capacity
+        fields may only be lowered or restored, never raised past their
+        startup values.
+
+        Returns:
+            the applied fields and their effective values
+        """
+        return self.llm_engine.update_engine_args(overrides)
+
     def __repr__(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
         # Cache the result to avoid repeated collective_rpc calls
