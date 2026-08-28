@@ -571,8 +571,9 @@ def test_get_numel_loaded():
         return "value"
 
     args = inspect.signature(complex_weight_loader).bind(param, loaded_weight)
-    num_loaded, ret = get_numel_loaded(complex_weight_loader, args)
+    num_loaded, num_filled, ret = get_numel_loaded(complex_weight_loader, args)
     assert num_loaded == 6
+    assert num_filled == 0
     assert ret == "value"
 
 
@@ -586,8 +587,25 @@ def test_get_numel_loaded_caps_at_param_size():
     loader = composed_weight_loader(default_weight_loader, lambda x: x + 1)
 
     args = inspect.signature(loader).bind(param, loaded_weight)
-    num_loaded, _ = get_numel_loaded(loader, args)
+    num_loaded, _, _ = get_numel_loaded(loader, args)
     assert num_loaded == 10
+
+
+def test_get_numel_loaded_counts_padding_fills():
+    # Vocab-padded params (e.g. VocabParallelEmbedding) copy the checkpoint
+    # rows and fill_ the padding rows; the fill count lets partial reloads
+    # tell a padded-but-complete param from an incomplete one.
+    param = torch.empty(10)
+    loaded_weight = torch.ones(6)
+
+    def padded_weight_loader(param, loaded_weight):
+        param.data[:6].copy_(loaded_weight)
+        param.data[6:].fill_(0)
+
+    args = inspect.signature(padded_weight_loader).bind(param, loaded_weight)
+    num_loaded, num_filled, _ = get_numel_loaded(padded_weight_loader, args)
+    assert num_loaded == 6
+    assert num_filled == 4
 
 
 def test_layerwise_loading_warning_only_checks_new_layers(monkeypatch):
@@ -1132,6 +1150,34 @@ def test_partial_reload_restores_bracketed_but_unloaded_layer():
     assert rolled_back == []
     assert torch.equal(model.first.weight, loaded_weight)
     assert torch.equal(model.second.weight, original_values)
+
+
+def test_partial_reload_commits_padded_layer():
+    """A layer whose loader fills its padding (e.g. vocab padding) is
+    complete, not rolled back, in partial mode."""
+
+    def padded_weight_loader(param, loaded_weight):
+        param.data[:6].copy_(loaded_weight)
+        param.data[6:].fill_(0)
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight", torch.nn.Parameter(torch.ones(10), requires_grad=False)
+    )
+    layer.weight.weight_loader = padded_weight_loader
+    model = torch.nn.Sequential(layer)
+    loaded_weight = torch.full((6,), 7.0)
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model, modules=_subtree(model))
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+    rolled_back = finalize_layerwise_reload(
+        model, Mock(), modules=_subtree(model), partial=True
+    )
+
+    assert rolled_back == []
+    assert torch.equal(layer.weight[:6], loaded_weight)
+    assert torch.equal(layer.weight[6:], torch.zeros(4))
 
 
 def test_partial_reload_rolls_back_incomplete_layer():

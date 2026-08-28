@@ -23,6 +23,10 @@ class LayerReloadingInfo:
     load_numel: int = 0
     load_numel_total: int | None = None
 
+    # elements written by fill_ (padding); together with load_numel this tells a
+    # padded-but-complete layer from an incomplete one during partial reloads
+    load_numel_filled: int = 0
+
     # used by `online_process_loader` to buffer args and tensors until ready to load
     loaded_weights: list[tuple[str, BoundArguments]] = field(default_factory=list)
 

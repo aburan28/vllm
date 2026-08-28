@@ -60,7 +60,8 @@ alias fails loudly.
 
 Weights must not change while a forward pass reads them. In the online server
 pause first, exactly as for [weight transfer](async_rl.md); offline, call
-between `generate` calls.
+between `generate` calls. `reload_weights` resets the prefix cache after the
+update, so KV computed with the old weights is never reused.
 
 ### Online (`VLLM_SERVER_DEV_MODE=1`)
 
@@ -139,6 +140,8 @@ save_file(changed, "/checkpoints/step_100_delta/model.safetensors")
   reloading from disk; any iterator of `(name, tensor)` works via the Python
   API.
 - The layer-completeness accounting follows the
-  [layerwise limitations](layerwise.md): a quant scheme that pads weights may
-  report a complete layer as incomplete and roll it back (the reload then
-  fails loudly rather than corrupting).
+  [layerwise limitations](layerwise.md). Padding a loader writes itself (e.g.
+  zeroed vocab padding) counts toward completeness; a quant scheme that pads
+  weights without writing the padding may report a complete layer as
+  incomplete and roll it back (the reload then fails loudly rather than
+  corrupting).

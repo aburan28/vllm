@@ -1214,7 +1214,9 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
+        # Against the startup bound: hot-lowering max_num_seqs via
+        # update_config caps new admissions while running requests drain.
+        assert len(self.running) <= self.startup_max_num_seqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -2591,8 +2593,9 @@ class Scheduler(SchedulerInterface):
 
         Capacity fields may only be lowered or restored, never raised past
         their startup values: worker-side buffers were sized by those at
-        startup. Runs on the engine core loop, so updates are serialized
-        with scheduling steps.
+        startup. Lowering a capacity field caps new admissions; already
+        running requests keep going and drain naturally. Runs on the engine
+        core loop, so updates are serialized with scheduling steps.
 
         Returns:
             the applied fields and their effective values
@@ -2607,41 +2610,50 @@ class Scheduler(SchedulerInterface):
                     f"Cannot hot-update scheduler config field {key!r}. "
                     f"Updatable fields: {sorted(HOT_UPDATABLE_SCHEDULER_CONFIG)}"
                 )
-            if key == "max_num_seqs" and not (
-                isinstance(value, int) and 1 <= value <= self.startup_max_num_seqs
-            ):
-                raise ValueError(
-                    f"max_num_seqs must be an integer in "
-                    f"[1, {self.startup_max_num_seqs}] (the startup value), "
-                    f"got {value}"
-                )
-            if key == "max_num_batched_tokens":
-                if not (
-                    isinstance(value, int)
-                    and 1 <= value <= self.startup_max_num_batched_tokens
-                ):
-                    raise ValueError(
-                        f"max_num_batched_tokens must be an integer in "
-                        f"[1, {self.startup_max_num_batched_tokens}] (the "
-                        f"startup value), got {value}"
-                    )
-                if (
-                    not self.scheduler_config.enable_chunked_prefill
-                    and value < self.max_model_len
-                ):
-                    raise ValueError(
-                        f"max_num_batched_tokens ({value}) must be >= "
-                        f"max_model_len ({self.max_model_len}) when chunked "
-                        "prefill is disabled, or long prompts can never be "
-                        "scheduled"
-                    )
-            if key == "long_prefill_token_threshold" and not (
-                isinstance(value, int) and value >= 0
-            ):
-                raise ValueError(
-                    f"long_prefill_token_threshold must be a non-negative "
-                    f"integer, got {value}"
-                )
+            # bool is an int subclass; a JSON true/false must not pass.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer, got {value!r}")
+
+        # Validate the prospective state jointly (overrides on top of the
+        # current values), mirroring the invariants SchedulerConfig enforces
+        # at startup.
+        def prospective(key: str) -> int:
+            return overrides.get(key, getattr(self.scheduler_config, key))
+
+        max_num_seqs = prospective("max_num_seqs")
+        max_num_batched_tokens = prospective("max_num_batched_tokens")
+        long_prefill_token_threshold = prospective("long_prefill_token_threshold")
+        if not 1 <= max_num_seqs <= self.startup_max_num_seqs:
+            raise ValueError(
+                f"max_num_seqs must be in [1, {self.startup_max_num_seqs}] "
+                f"(the startup value), got {max_num_seqs}"
+            )
+        if not 1 <= max_num_batched_tokens <= self.startup_max_num_batched_tokens:
+            raise ValueError(
+                f"max_num_batched_tokens must be in "
+                f"[1, {self.startup_max_num_batched_tokens}] (the startup "
+                f"value), got {max_num_batched_tokens}"
+            )
+        if (
+            not self.scheduler_config.enable_chunked_prefill
+            and max_num_batched_tokens < self.max_model_len
+        ):
+            raise ValueError(
+                f"max_num_batched_tokens ({max_num_batched_tokens}) must be "
+                f">= max_model_len ({self.max_model_len}) when chunked "
+                "prefill is disabled, or long prompts can never be scheduled"
+            )
+        if max_num_batched_tokens < max_num_seqs:
+            raise ValueError(
+                f"max_num_batched_tokens ({max_num_batched_tokens}) must be "
+                f">= max_num_seqs ({max_num_seqs})"
+            )
+        if not 0 <= long_prefill_token_threshold <= self.max_model_len:
+            raise ValueError(
+                f"long_prefill_token_threshold "
+                f"({long_prefill_token_threshold}) must be in "
+                f"[0, max_model_len ({self.max_model_len})]"
+            )
 
         for key, value in overrides.items():
             setattr(self.scheduler_config, key, value)

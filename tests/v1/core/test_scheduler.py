@@ -6165,6 +6165,12 @@ def test_update_config_hot_updates_allowlisted_fields():
         scheduler.update_config({"max_num_seqs": 17})
     with pytest.raises(ValueError, match="Cannot hot-update"):
         scheduler.update_config({"max_model_len": 1024})
+    with pytest.raises(ValueError, match="integer"):
+        scheduler.update_config({"max_num_seqs": True})
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        scheduler.update_config({"max_num_batched_tokens": 8})
+    with pytest.raises(ValueError, match="max_model_len"):
+        scheduler.update_config({"long_prefill_token_threshold": 10**9})
     assert scheduler.max_num_running_reqs == 16
 
     # An explicit max_num_scheduled_tokens keeps overriding the batch limit.

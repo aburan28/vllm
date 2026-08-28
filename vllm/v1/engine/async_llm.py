@@ -1194,8 +1194,15 @@ class AsyncLLM(EngineClient):
 
         Returns:
             the applied fields and their effective values
+
+        Raises:
+            ValueError: on an unknown field or an invalid value; nothing is
+                applied in that case.
         """
-        return await self.engine_core.update_scheduler_config_async(overrides)
+        result = await self.engine_core.update_scheduler_config_async(overrides)
+        if "error" in result:
+            raise ValueError(result["error"])
+        return result["applied"]
 
     async def reload_weights(
         self,
@@ -1223,5 +1230,7 @@ class AsyncLLM(EngineClient):
         if weight_name_prefixes is not None:
             kwargs["weight_name_prefixes"] = weight_name_prefixes
         await self.collective_rpc("reload_weights", kwargs=kwargs)
+        # Cached prefix KV was computed with the old weights.
+        await self.reset_prefix_cache()
         if weight_version is not None:
             await self.update_weight_version(weight_version)

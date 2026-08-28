@@ -986,8 +986,16 @@ class EngineCore:
         return self._weight_version
 
     def update_scheduler_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
-        """Hot-update allowlisted scheduler config fields at runtime."""
-        return self.scheduler.update_config(overrides)
+        """Hot-update allowlisted scheduler config fields at runtime.
+
+        Returns ``{"applied": ...}`` or ``{"error": ...}``: a raised
+        ValueError would cross the MP utility boundary as a bare Exception,
+        so the client re-raises the typed error from the structured result.
+        """
+        try:
+            return {"applied": self.scheduler.update_config(overrides)}
+        except ValueError as e:
+            return {"error": str(e)}
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.

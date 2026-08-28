@@ -932,6 +932,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         if weight_name_prefixes is not None:
             kwargs["weight_name_prefixes"] = weight_name_prefixes
         self.llm_engine.collective_rpc("reload_weights", kwargs=kwargs)
+        # Cached prefix KV was computed with the old weights.
+        self.llm_engine.reset_prefix_cache()
         if weight_version is not None:
             self.llm_engine.set_weight_version(weight_version)
 

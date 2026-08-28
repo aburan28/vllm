@@ -236,6 +236,15 @@ async def reload_weights(
 
     engine = engine_client(raw_request)
 
+    # Worker-raised ValueErrors cross the MP utility boundary as bare
+    # Exceptions, so classify by the reload path's own validation messages.
+    reload_input_errors = (
+        "No checkpoint weights matched",
+        "cannot be partially reloaded",
+        "rolled back to their previous weights",
+        "Partial reloads require weights in checkpoint format",
+    )
+
     try:
         await engine.reload_weights(
             weights_path=weights_path,
@@ -251,7 +260,12 @@ async def reload_weights(
             content={"error": str(err)},
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
-    except Exception as err:  # pragma: no cover - defensive
+    except Exception as err:
+        if any(marker in str(err) for marker in reload_input_errors):
+            return JSONResponse(
+                content={"error": str(err)},
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
         logger.exception("Failed to reload weights")
         return JSONResponse(
             content={"error": f"Failed to reload weights: {err}"},

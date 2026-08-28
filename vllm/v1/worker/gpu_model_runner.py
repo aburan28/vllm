@@ -329,18 +329,18 @@ def _reload_weights_partial(
         model.load_weights(iter(weights))
     finally:
         # Always finalize so complete layers commit and incomplete ones roll
-        # back, leaving the model consistent even if loading raised.
+        # back, leaving the model consistent even if loading raised. The
+        # resets run here too: committed layers must not pair with stale
+        # LoRA state or cached encoder outputs.
         rolled_back = finalize_layerwise_reload(
             model, runner.model_config, modules=touched_modules, partial=True
         )
-
-    runner.reset_lora_state()
+        runner.reset_lora_state()
+        runner.reset_encoder_cache()
+        runner.reset_mm_cache()
 
     diff_seconds = time.perf_counter() - counter_before_reloading
     logger.info("Partial weight reload and processing took %.2f seconds", diff_seconds)
-
-    runner.reset_encoder_cache()
-    runner.reset_mm_cache()
 
     if rolled_back:
         module_names = {id(m): n for n, m in model.named_modules()}

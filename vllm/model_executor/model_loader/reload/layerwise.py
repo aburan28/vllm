@@ -198,8 +198,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
 
         # Buffer loaded weights, track loading progress
         info.loaded_weights.append((param_name, bound_args))
-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        num_loaded, num_filled, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
+        info.load_numel_filled += num_filled
 
         logger.debug(
             "%s: %d / %d",
@@ -307,7 +308,11 @@ def finalize_layerwise_processing(
         # Having too many of these delayed layers can lead to excess memory usage
         # see Limitations(4)
         elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
-            if partial:
+            # Filled elements (e.g. zeroed vocab padding) count toward
+            # completeness: a padded-but-complete layer commits.
+            if partial and (
+                info.load_numel + info.load_numel_filled < info.load_numel_total  # type: ignore[operator]
+            ):
                 # Processing here would commit partially uninitialized data, so
                 # restore the layer's previous weights instead. Layers are the
                 # atomic unit of a partial reload: supply every checkpoint
