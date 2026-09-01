@@ -91,7 +91,7 @@ Mooncake reads its `MC_*` settings from the process environment when the Transfe
 
 ### mooncake_async_transfer
 
-By default the prefiller submits each batch of block copies with `batch_transfer_async_write` on its sender event loop and waits for completion through `get_batch_transfer_status` on one poller thread, keeping at most `num_workers` batches in flight. This replaces `num_workers` threads that each blocked inside `batch_transfer_sync_write`. Transfer statistics (`MooncakeKVConnectorStats`) are recorded the same way in both modes, measured from submission to completion.
+By default the prefiller submits each batch of block copies with `batch_transfer_async_write` on its sender event loop and polls it there with the non-blocking `batch_transfer_poll` (sleeping 50 µs, doubling to 2 ms), falling back to `get_batch_transfer_status` on one poller thread with wheels that lack it, keeping at most `num_workers` batches in flight. This replaces `num_workers` threads that each blocked inside `batch_transfer_sync_write`. Transfer statistics (`MooncakeKVConnectorStats`) are recorded the same way in both modes, measured from submission to completion.
 
 Set `mooncake_async_transfer` to `false` to keep the thread-pool path. The connector also falls back to it automatically when the installed Mooncake wheel does not expose the asynchronous batch API. The asynchronous engine API does not retry a batch that fails in flight, while `batch_transfer_sync_write` retries once per RDMA context, so multi-NIC RDMA deployments that rely on those retries may prefer the thread-pool path.
 

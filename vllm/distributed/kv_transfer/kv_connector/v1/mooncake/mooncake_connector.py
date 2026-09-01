@@ -67,6 +67,11 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
+# In-loop poll backoff for async batches: a short start keeps small batches
+# snappy, the cap keeps a long transfer from spinning the sender loop.
+_ASYNC_POLL_MIN_SLEEP_S = 50e-6
+_ASYNC_POLL_MAX_SLEEP_S = 2e-3
+
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -957,6 +962,13 @@ class MooncakeConnectorWorker:
             hasattr(self.engine, name)
             for name in ("batch_transfer_async_write", "get_batch_transfer_status")
         )
+        # Newer wheels add a non-blocking batch_transfer_poll / _free pair, so
+        # the sender loop can poll in place instead of parking a thread in the
+        # blocking get_batch_transfer_status.
+        self.use_nonblocking_poll = self.use_async_transfer and all(
+            hasattr(self.engine, name)
+            for name in ("batch_transfer_poll", "batch_transfer_free")
+        )
         protocol = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
             "mooncake_protocol", "rdma"
         )
@@ -1009,19 +1021,31 @@ class MooncakeConnectorWorker:
             # Background threads for sending kvcaches to D.
             # Each pool thread must be bound to the correct CUDA device
             # because CUDA device selection is thread-local.
-            # With async transfers the loop thread submits batches and this
-            # pool shrinks to one poller thread that waits for completions;
-            # num_workers then caps the batches in flight instead.
-            self._sender_executor = ThreadPoolExecutor(
-                max_workers=1 if self.use_async_transfer else self.num_sender_workers,
-                thread_name_prefix="vllm-mooncake-sender",
-                initializer=self._bind_sender_thread_device,
-            )
+            # Sync transfers block num_workers pool threads. Async transfers
+            # are submitted on the loop thread and need one poller thread for
+            # the blocking status call, or no pool at all when the loop polls
+            # in place; num_workers then caps the batches in flight instead.
+            if not self.use_async_transfer:
+                pool_workers, transfer_mode = self.num_sender_workers, "sync"
+            elif self.use_nonblocking_poll:
+                pool_workers, transfer_mode = 0, "async submit/poll"
+            else:
+                pool_workers, transfer_mode = 1, "async submit/blocking wait"
+            self._sender_executor: ThreadPoolExecutor | None = None
+            if pool_workers:
+                self._sender_executor = ThreadPoolExecutor(
+                    max_workers=pool_workers,
+                    thread_name_prefix="vllm-mooncake-sender",
+                    initializer=self._bind_sender_thread_device,
+                )
             self._inflight_batches = asyncio.Semaphore(self.num_sender_workers)
             self._sender_loop_device_bound = False
+            # Bumped whenever a polled batch turns terminal so the other
+            # in-flight polls restart their backoff from the minimum.
+            self._async_progress_epoch = 0
             logger.info(
                 "Mooncake Prefiller: %s transfers with at most %d in flight",
-                "async submit/poll" if self.use_async_transfer else "sync",
+                transfer_mode,
                 self.num_sender_workers,
             )
             # An asyncio queue to buffer incoming requests for the sender
@@ -1123,7 +1147,8 @@ class MooncakeConnectorWorker:
         """Cleanup background threads on destruction."""
         self.async_zmq_ctx.term()
         if not self.is_kv_consumer:
-            self._sender_executor.shutdown(wait=False)
+            if self._sender_executor is not None:
+                self._sender_executor.shutdown(wait=False)
             if self.sender_loop.is_running():
                 self.sender_loop.call_soon_threadsafe(self.sender_loop.stop)
                 self._sender_listener_t.join()
@@ -1688,11 +1713,13 @@ class MooncakeConnectorWorker:
         """Submit one batch on the sender loop and await its completion.
 
         ``batch_transfer_async_write`` returns a batch id, or 0 on failure.
-        ``get_batch_transfer_status`` blocks (GIL released) until every listed
-        batch is terminal, frees the batch ids itself, and returns 0 when all
-        completed or -1 on failure/timeout; it therefore runs on the single
-        poller thread, never on the loop. Completions are observed in
-        submission order and at most ``num_workers`` batches are in flight.
+        With the non-blocking ``batch_transfer_poll`` the loop itself sleeps
+        and polls the batch (see ``_poll_batch``) and then releases the id
+        with ``batch_transfer_free``. Older wheels only offer the blocking
+        ``get_batch_transfer_status`` (GIL released, frees the ids itself),
+        which runs on the single poller thread, never on the loop. Either
+        way a completed batch yields 0 and a failed or timed-out one -1, and
+        at most ``num_workers`` batches are in flight.
         """
         if not self._sender_loop_device_bound:
             self._bind_sender_thread_device()
@@ -1704,7 +1731,10 @@ class MooncakeConnectorWorker:
             )
             if batch_id == 0:
                 ret_value = -1
+            elif self.use_nonblocking_poll:
+                ret_value = await self._poll_batch(batch_id)
             else:
+                assert self._sender_executor is not None
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self.engine.get_batch_transfer_status,
@@ -1715,6 +1745,31 @@ class MooncakeConnectorWorker:
             remote_session, ret_value, duration, src_ptrs, lengths
         )
         return ret_value
+
+    async def _poll_batch(self, batch_id: int) -> int:
+        """Sleep/poll ``batch_id`` on the loop until terminal, then free it.
+
+        ``batch_transfer_poll`` reports 0 completed, 1 in flight or -1 failed
+        / timed out per batch. The sleep starts at 50 us and doubles to a
+        2 ms cap while nothing changes; since batches complete roughly in
+        submission order it restarts from 50 us once any batch turns
+        terminal. Returns 0 on completion, -1 otherwise.
+        """
+        backoff = _ASYNC_POLL_MIN_SLEEP_S
+        epoch = self._async_progress_epoch
+        while True:
+            await asyncio.sleep(backoff)
+            status = self.engine.batch_transfer_poll([batch_id])[0]
+            if status != 1:
+                break
+            if epoch != self._async_progress_epoch:
+                epoch = self._async_progress_epoch
+                backoff = _ASYNC_POLL_MIN_SLEEP_S
+            else:
+                backoff = min(backoff * 2, _ASYNC_POLL_MAX_SLEEP_S)
+        self.engine.batch_transfer_free([batch_id])
+        self._async_progress_epoch += 1
+        return 0 if status == 0 else -1
 
     def _record_transfer_result(
         self,

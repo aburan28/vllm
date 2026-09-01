@@ -6,6 +6,7 @@ import contextlib
 import os
 import threading
 import time
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,6 +46,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 from .utils import create_request, create_scheduler, create_vllm_config
+
+
+@pytest.fixture(autouse=True)
+def _pin_device_index_without_accelerator(monkeypatch):
+    """The worker captures its device index at init, which torch refuses on a
+    host without an accelerator; pin it to 0 there."""
+    if not torch.accelerator.is_available():
+        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -135,6 +144,47 @@ class FakeAsyncMooncakeWrapper(FakeMooncakeWrapper):
             if batch_id in self.failed_batches:
                 ret_value = -1
         return ret_value
+
+
+class FakePollingMooncakeWrapper(FakeAsyncMooncakeWrapper):
+    """Fake engine of a newer wheel with the non-blocking poll / free pair.
+
+    ``batch_transfer_poll`` reports a batch in flight while it is ``held`` or
+    for its first ``in_flight_polls`` polls (``in_flight_polls_by_batch``
+    overrides per id), then 0, or -1 for a batch in ``failed_batches``.
+    ``batch_transfer_free`` records the id and rejects a second free.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.in_flight_polls = 0
+        self.in_flight_polls_by_batch: dict[int, int] = {}
+        self.held: set[int] = set()
+        self.poll_calls: list[list[int]] = []
+        self.poll_counts: dict[int, int] = defaultdict(int)
+
+    def batch_transfer_poll(self, batch_ids) -> list[int]:
+        self.poll_calls.append(list(batch_ids))
+        statuses = []
+        for batch_id in batch_ids:
+            assert batch_id in self.submitted, f"unknown batch {batch_id}"
+            assert batch_id not in self.freed, f"batch {batch_id} polled after free"
+            self.poll_counts[batch_id] += 1
+            in_flight_polls = self.in_flight_polls_by_batch.get(
+                batch_id, self.in_flight_polls
+            )
+            if batch_id in self.held or self.poll_counts[batch_id] <= in_flight_polls:
+                statuses.append(1)
+            elif batch_id in self.failed_batches:
+                statuses.append(-1)
+            else:
+                statuses.append(0)
+        return statuses
+
+    def batch_transfer_free(self, batch_ids) -> None:
+        for batch_id in batch_ids:
+            assert batch_id not in self.freed, f"batch {batch_id} freed twice"
+            self.freed.append(batch_id)
 
 
 def test_align_transfer_regions_uses_layer_name_occurrences():
@@ -1523,6 +1573,26 @@ async def _wait_until(predicate, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.005)
 
 
+@contextlib.contextmanager
+def _recording_sleep():
+    """Record every asyncio.sleep delay, tagged with the sleeping task's name,
+    while only yielding to the loop so backoff sequences run instantly."""
+
+    real_sleep = asyncio.sleep
+    delays: list[tuple[str, float]] = []
+
+    async def fake_sleep(delay, result=None):
+        task = asyncio.current_task()
+        delays.append((task.get_name() if task else "", delay))
+        return await real_sleep(0, result)
+
+    with patch("asyncio.sleep", fake_sleep):
+        yield delays
+
+
+_POLL_SLEEPS_TO_CAP = [50e-6, 100e-6, 200e-6, 400e-6, 800e-6, 1.6e-3, 2e-3]
+
+
 def test_mooncake_env_is_applied_before_engine_init(monkeypatch):
     """mooncake_env exports MC_* knobs before TransferEngine() reads them,
     while values already present in the environment are kept."""
@@ -1568,13 +1638,25 @@ def test_apply_mooncake_env_rejects_malformed_values(bad_env):
 
 
 @pytest.mark.asyncio
-async def test_async_transfer_completes_and_records_stats():
-    """The submit/poll path serves a pull, frees the batch and records stats
-    the same way the sync path does."""
+@pytest.mark.parametrize(
+    "engine_cls",
+    [FakeAsyncMooncakeWrapper, FakePollingMooncakeWrapper],
+    ids=["blocking_status", "nonblocking_poll"],
+)
+async def test_async_transfer_completes_and_records_stats(engine_cls):
+    """The submit/poll path serves a pull, frees the batch exactly once and
+    records stats the same way the sync path does. A wheel without the
+    non-blocking poll API waits on the single poller thread instead."""
 
-    with _producer_worker(FakeAsyncMooncakeWrapper) as worker:
+    with _producer_worker(engine_cls) as worker:
         assert worker.use_async_transfer
-        assert worker._sender_executor._max_workers == 1
+        polling = engine_cls is FakePollingMooncakeWrapper
+        assert worker.use_nonblocking_poll is polling
+        if polling:
+            assert worker._sender_executor is None
+            worker.engine.in_flight_polls = 3
+        else:
+            assert worker._sender_executor._max_workers == 1
 
         response = await _send_one_request(worker)
 
@@ -1587,7 +1669,11 @@ async def test_async_transfer_completes_and_records_stats():
                 [2 * _ASYNC_BLOCK_LEN],
             )
         }
-        assert engine.status_calls == [[1]]
+        if polling:
+            assert engine.poll_calls == [[1]] * 4
+            assert engine.status_calls == []
+        else:
+            assert engine.status_calls == [[1]]
         assert engine.freed == [1]
         assert response.status == MooncakeXferResponseStatus.FINISH
         assert response.ok_reqs == ["d-req-async"]
@@ -1602,18 +1688,26 @@ async def test_async_transfer_completes_and_records_stats():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["submit", "status"])
+@pytest.mark.parametrize("failure", ["submit", "status", "poll"])
 async def test_async_transfer_failure_marks_request_failed(failure: str):
-    """A 0 batch id or a failed poll surfaces like a sync engine error."""
+    """A 0 batch id, a failed blocking status or a -1 poll surfaces like a
+    sync engine error; a polled batch is still freed exactly once."""
 
-    with _producer_worker(FakeAsyncMooncakeWrapper) as worker:
+    engine_cls = (
+        FakePollingMooncakeWrapper if failure == "poll" else FakeAsyncMooncakeWrapper
+    )
+    with _producer_worker(engine_cls) as worker:
         if failure == "submit":
             worker.engine.fail_submit = True
         else:
             worker.engine.failed_batches = {1}
+            worker.engine.in_flight_polls = 1
 
         response = await _send_one_request(worker)
 
+        if failure == "poll":
+            assert worker.engine.poll_calls == [[1], [1]]
+            assert worker.engine.freed == [1]
         assert response.status == MooncakeXferResponseStatus.FINISH
         assert response.ok_reqs is None
         assert response.err_reqs == ["d-req-async"]
@@ -1630,20 +1724,37 @@ async def test_async_transfer_failure_marks_request_failed(failure: str):
     [
         (FakeMooncakeWrapper, None, False),
         (FakeAsyncMooncakeWrapper, {"mooncake_async_transfer": False}, False),
+        (FakePollingMooncakeWrapper, {"mooncake_async_transfer": False}, False),
         (FakeAsyncMooncakeWrapper, None, True),
+        (FakePollingMooncakeWrapper, None, True),
     ],
-    ids=["engine_without_async_api", "async_disabled", "async_default"],
+    ids=[
+        "engine_without_async_api",
+        "async_disabled",
+        "async_disabled_with_poll_api",
+        "async_blocking_status",
+        "async_nonblocking_poll",
+    ],
 )
 async def test_async_transfer_falls_back_to_sync_executor(
     engine_cls, extra_config, expect_async: bool
 ):
     """Without the async API or with the flag off, transfers keep going
-    through batch_transfer_sync_write on the num_workers thread pool."""
+    through batch_transfer_sync_write on the num_workers thread pool; the
+    pool shrinks to one poller thread for the blocking status call and is
+    not created at all when the loop polls in place."""
 
     with _producer_worker(engine_cls, extra_config) as worker:
         assert worker.use_async_transfer is expect_async
-        expected_workers = 1 if expect_async else worker.num_sender_workers
-        assert worker._sender_executor._max_workers == expected_workers
+        if not expect_async:
+            assert not worker.use_nonblocking_poll
+            assert worker._sender_executor._max_workers == worker.num_sender_workers
+        elif worker.use_nonblocking_poll:
+            assert engine_cls is FakePollingMooncakeWrapper
+            assert worker._sender_executor is None
+        else:
+            assert engine_cls is FakeAsyncMooncakeWrapper
+            assert worker._sender_executor._max_workers == 1
 
         with patch.object(
             worker.engine, "batch_transfer_sync_write", return_value=0
@@ -1685,4 +1796,93 @@ async def test_async_transfer_respects_inflight_cap():
 
         assert await asyncio.gather(*tasks) == [0, 0, 0]
         assert engine.status_calls == [[1], [2], [3]]
+        assert len(worker.xfer_stats.data["transfer_duration"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_poll_backoff_doubles_to_cap():
+    """The in-loop poll sleeps 50 us before its first poll and doubles up to
+    the 2 ms cap while the batch stays in flight."""
+
+    with _producer_worker(FakePollingMooncakeWrapper) as worker:
+        worker.engine.in_flight_polls = 8
+        with _recording_sleep() as sleeps:
+            ret_value = await worker._send_blocks_async(
+                "consumer-host:54321", [0x1000], [0x2000], [_ASYNC_BLOCK_LEN]
+            )
+
+        assert ret_value == 0
+        delays = [delay for _, delay in sleeps]
+        assert delays == pytest.approx(_POLL_SLEEPS_TO_CAP + [2e-3, 2e-3])
+        assert worker.engine.poll_calls == [[1]] * 9
+        assert worker.engine.freed == [1]
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_poll_backoff_resets_when_another_batch_completes():
+    """Batches complete roughly in submission order, so once any batch turns
+    terminal the other in-flight polls restart their backoff from 50 us."""
+
+    with _producer_worker(FakePollingMooncakeWrapper) as worker:
+        engine = worker.engine
+        engine.in_flight_polls = 7
+        engine.in_flight_polls_by_batch = {1: 3}
+        with _recording_sleep() as sleeps:
+            tasks = [
+                asyncio.create_task(
+                    worker._send_blocks_async(
+                        "consumer-host:54321",
+                        [0x1000 + i * _ASYNC_BLOCK_LEN],
+                        [0x2000 + i * _ASYNC_BLOCK_LEN],
+                        [_ASYNC_BLOCK_LEN],
+                    ),
+                    name=f"batch-{i + 1}",
+                )
+                for i in range(2)
+            ]
+            assert await asyncio.gather(*tasks) == [0, 0]
+
+        delays_by_task: dict[str, list[float]] = defaultdict(list)
+        for name, delay in sleeps:
+            delays_by_task[name].append(delay)
+        assert delays_by_task["batch-1"] == pytest.approx(_POLL_SLEEPS_TO_CAP[:4])
+        # Batch 2 had doubled to 400 us when batch 1 completed, then restarted.
+        assert delays_by_task["batch-2"] == pytest.approx(
+            _POLL_SLEEPS_TO_CAP[:4] + _POLL_SLEEPS_TO_CAP[:4]
+        )
+        assert engine.freed == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_poll_respects_inflight_cap():
+    """With in-loop polling, num_workers still caps the batches in flight and
+    every batch is freed exactly once without touching the blocking API."""
+
+    with _producer_worker(FakePollingMooncakeWrapper, {"num_workers": 2}) as worker:
+        engine = worker.engine
+        engine.held = {1, 2, 3}
+        tasks = [
+            asyncio.create_task(
+                worker._send_blocks_async(
+                    "consumer-host:54321",
+                    [0x1000 + i * _ASYNC_BLOCK_LEN],
+                    [0x2000 + i * _ASYNC_BLOCK_LEN],
+                    [_ASYNC_BLOCK_LEN],
+                )
+            )
+            for i in range(3)
+        ]
+
+        await _wait_until(lambda: len(engine.submitted) == 2)
+        await asyncio.sleep(0.05)
+        assert len(engine.submitted) == 2
+
+        engine.held.discard(1)
+        await _wait_until(lambda: len(engine.submitted) == 3)
+        engine.held.clear()
+
+        assert await asyncio.gather(*tasks) == [0, 0, 0]
+        assert worker._sender_executor is None
+        assert engine.status_calls == []
+        assert sorted(engine.freed) == [1, 2, 3]
         assert len(worker.xfer_stats.data["transfer_duration"]) == 3
