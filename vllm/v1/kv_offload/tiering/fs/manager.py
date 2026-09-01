@@ -52,7 +52,9 @@ from vllm.v1.kv_offload.tiering.base import (
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
+    load_uring_module,
     probe_o_direct,
+    register_uring_buffer,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -195,6 +197,11 @@ class FileSystemTierManager(SecondaryTierManager):
                 tier_type,
             )
 
+        # Optional io_uring backend (VLLM_KV_OFFLOAD_DISK_IO_BACKEND=io_uring).
+        self._uring = load_uring_module()
+        if self._uring is not None:
+            register_uring_buffer(self._uring, primary_kv_view)
+
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
@@ -226,6 +233,7 @@ class FileSystemTierManager(SecondaryTierManager):
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._block_size,
             self._use_o_direct,
+            self._uring,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -247,6 +255,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     offsets,
                     self._block_size,
                     self._use_o_direct,
+                    self._uring,
                 )
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
@@ -341,3 +350,6 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
+        if self._uring is not None:
+            self._uring.unregister_global_buffer()
+            self._uring = None

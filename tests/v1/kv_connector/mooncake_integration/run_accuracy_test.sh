@@ -35,9 +35,17 @@ fi
 # layers, and the QP handshake then fails to reach RTR. Set to a different NIC
 # on other hardware, or to the empty string to discover every device.
 MOONCAKE_DEVICE_NAME=${MOONCAKE_DEVICE_NAME-mlx5_12}
+# Extra kv_connector_extra_config members applied to both sides, written as
+# JSON object members without the surrounding braces, e.g.
+# '"mooncake_protocol":"tcp","mooncake_env":{"MC_TCP_IO_BACKEND":"io_uring"}'
+MOONCAKE_EXTRA_CONFIG=${MOONCAKE_EXTRA_CONFIG:-}
 kv_config() {
   printf '{"kv_connector":"MooncakeConnector","kv_role":"%s",' "$1"
-  printf '"kv_connector_extra_config":{"device_name":"%s"}}' "${MOONCAKE_DEVICE_NAME}"
+  printf '"kv_connector_extra_config":{"device_name":"%s"' "${MOONCAKE_DEVICE_NAME}"
+  if [[ -n "$MOONCAKE_EXTRA_CONFIG" ]]; then
+    printf ',%s' "$MOONCAKE_EXTRA_CONFIG"
+  fi
+  printf '}}'
 }
 KV_CONFIG_P=$(kv_config kv_producer)
 KV_CONFIG_D=$(kv_config kv_consumer)

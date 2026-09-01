@@ -3,6 +3,8 @@
 
 import asyncio
 import contextlib
+import os
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _apply_mooncake_env,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -86,6 +89,52 @@ class FakeMooncakeWrapper:
 
     def batch_register_memory(self, buffer_addresses, capacities) -> int:
         return 0
+
+
+class FakeAsyncMooncakeWrapper(FakeMooncakeWrapper):
+    """Fake engine that also exposes the submit/poll batch API.
+
+    ``get_batch_transfer_status`` mimics the pybind contract: it blocks until
+    every listed batch is terminal (a ``gates`` entry holds a batch open),
+    frees the ids, and returns 0 on success or -1 when any batch failed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.next_batch_id = 1
+        self.submitted: dict[int, tuple[str, list[int], list[int], list[int]]] = {}
+        self.status_calls: list[list[int]] = []
+        self.freed: list[int] = []
+        self.fail_submit = False
+        self.failed_batches: set[int] = set()
+        self.gates: dict[int, threading.Event] = {}
+
+    def batch_transfer_async_write(
+        self, target_hostname, buffers, peer_buffer_addresses, lengths
+    ) -> int:
+        if self.fail_submit:
+            return 0
+        batch_id = self.next_batch_id
+        self.next_batch_id += 1
+        self.submitted[batch_id] = (
+            target_hostname,
+            list(buffers),
+            list(peer_buffer_addresses),
+            list(lengths),
+        )
+        return batch_id
+
+    def get_batch_transfer_status(self, batch_ids) -> int:
+        self.status_calls.append(list(batch_ids))
+        ret_value = 0
+        for batch_id in batch_ids:
+            gate = self.gates.get(batch_id)
+            if gate is not None:
+                assert gate.wait(timeout=10), f"batch {batch_id} never released"
+            self.freed.append(batch_id)
+            if batch_id in self.failed_batches:
+                ret_value = -1
+        return ret_value
 
 
 def test_align_transfer_regions_uses_layer_name_occurrences():
@@ -656,13 +705,13 @@ def test_scheduler_request_finished():
 
 
 @contextlib.contextmanager
-def patch_worker_dependencies():
+def patch_worker_dependencies(engine_cls=FakeMooncakeWrapper):
     """Helper to mock all distributed and network dependencies for Worker tests."""
 
     with (
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.TransferEngine",
-            FakeMooncakeWrapper,
+            engine_cls,
         ),
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_ip",
@@ -1401,3 +1450,239 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+
+
+_ASYNC_BLOCK_LEN = 4096
+
+
+@contextlib.contextmanager
+def _producer_worker(engine_cls=FakeMooncakeWrapper, extra_config=None):
+    """Producer worker with one registered layer, bound to the running loop."""
+
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config=extra_config,
+    )
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies(engine_cls):
+        worker = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+        worker.kv_caches_base_addr = [0x1000]
+        worker.block_len_per_layer = [_ASYNC_BLOCK_LEN]
+        worker.kv_block_len_per_layer = [_ASYNC_BLOCK_LEN]
+        worker.registered_layer_names = ["model.layers.0.self_attn"]
+        worker.registered_layer_indices = [0]
+        origin_sender_loop = worker.sender_loop
+        worker.sender_loop = asyncio.get_running_loop()
+        try:
+            yield worker
+        finally:
+            # Never leave the poller thread blocked on a gate at shutdown.
+            for gate in getattr(worker.engine, "gates", {}).values():
+                gate.set()
+            worker.sender_loop = origin_sender_loop
+            worker.shutdown()
+
+
+async def _send_one_request(worker: MooncakeConnectorWorker) -> MooncakeXferResponse:
+    """Serve one two-block pull and return the response sent to the consumer."""
+
+    transfer_id = "xfer-async"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-async",
+        transfer_id=transfer_id,
+        local_block_ids=[[10, 11]],
+        ready=asyncio.Event(),
+    )
+    worker.reqs_need_send[transfer_id] = send_meta
+    send_meta.ready.set()
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"d-req-async": (transfer_id, [[20, 21]])},
+        kv_caches_base_addr=[0x2000],
+        block_lens=[_ASYNC_BLOCK_LEN],
+        kv_block_lens=[_ASYNC_BLOCK_LEN],
+        registered_layer_names=["model.layers.0.self_attn"],
+        registered_layer_indices=[0],
+    )
+    sock = AsyncMock(spec=zmq.asyncio.Socket)
+    sock.send_multipart = AsyncMock()
+    await worker.send_kv_to_decode(b"consumer-async", sock, xfer_meta)
+    _, payload = sock.send_multipart.call_args[0][0]
+    return worker._xfer_resp_decoder.decode(payload)
+
+
+async def _wait_until(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not met in time"
+        await asyncio.sleep(0.005)
+
+
+def test_mooncake_env_is_applied_before_engine_init(monkeypatch):
+    """mooncake_env exports MC_* knobs before TransferEngine() reads them,
+    while values already present in the environment are kept."""
+
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    os.environ.pop("MC_TCP_IO_BACKEND", None)
+    os.environ["MC_FORCE_TCP"] = "0"
+    seen: dict[str, str | None] = {}
+
+    class EnvRecordingWrapper(FakeMooncakeWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            for name in ("MC_TCP_IO_BACKEND", "MC_FORCE_TCP"):
+                seen[name] = os.environ.get(name)
+
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config={
+            "mooncake_env": {"MC_TCP_IO_BACKEND": "io_uring", "MC_FORCE_TCP": 1}
+        },
+    )
+    with (
+        set_current_vllm_config(vllm_config),
+        patch_worker_dependencies(EnvRecordingWrapper),
+    ):
+        connector = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        )
+        connector.connector_worker.shutdown()
+
+    assert seen == {"MC_TCP_IO_BACKEND": "io_uring", "MC_FORCE_TCP": "0"}
+
+
+@pytest.mark.parametrize(
+    "bad_env",
+    ["MC_FORCE_TCP=1", {"MC_FORCE_TCP": True}, {1: "x"}, {"MC_X": None}],
+    ids=["not_a_dict", "bool_value", "non_str_key", "none_value"],
+)
+def test_apply_mooncake_env_rejects_malformed_values(bad_env):
+    with pytest.raises(ValueError, match="mooncake_env"):
+        _apply_mooncake_env(bad_env)
+
+
+@pytest.mark.asyncio
+async def test_async_transfer_completes_and_records_stats():
+    """The submit/poll path serves a pull, frees the batch and records stats
+    the same way the sync path does."""
+
+    with _producer_worker(FakeAsyncMooncakeWrapper) as worker:
+        assert worker.use_async_transfer
+        assert worker._sender_executor._max_workers == 1
+
+        response = await _send_one_request(worker)
+
+        engine = worker.engine
+        assert engine.submitted == {
+            1: (
+                "consumer-host:54321",
+                [0x1000 + 10 * _ASYNC_BLOCK_LEN],
+                [0x2000 + 20 * _ASYNC_BLOCK_LEN],
+                [2 * _ASYNC_BLOCK_LEN],
+            )
+        }
+        assert engine.status_calls == [[1]]
+        assert engine.freed == [1]
+        assert response.status == MooncakeXferResponseStatus.FINISH
+        assert response.ok_reqs == ["d-req-async"]
+        assert "p-req-async" in worker.finished_sending_reqs
+        assert "xfer-async" not in worker.reqs_need_send
+
+        stats = worker.xfer_stats.data
+        assert len(stats["transfer_duration"]) == 1
+        assert stats["bytes_transferred"] == [2 * _ASYNC_BLOCK_LEN]
+        assert stats["num_descriptors"] == [1]
+        assert stats["num_failed_transfers"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["submit", "status"])
+async def test_async_transfer_failure_marks_request_failed(failure: str):
+    """A 0 batch id or a failed poll surfaces like a sync engine error."""
+
+    with _producer_worker(FakeAsyncMooncakeWrapper) as worker:
+        if failure == "submit":
+            worker.engine.fail_submit = True
+        else:
+            worker.engine.failed_batches = {1}
+
+        response = await _send_one_request(worker)
+
+        assert response.status == MooncakeXferResponseStatus.FINISH
+        assert response.ok_reqs is None
+        assert response.err_reqs == ["d-req-async"]
+        assert response.err_msg == "Mooncake transfer engine returned -1"
+        assert "p-req-async" not in worker.finished_sending_reqs
+        assert "xfer-async" in worker.reqs_need_send
+        assert worker.xfer_stats.data["num_failed_transfers"] == [1]
+        assert worker.xfer_stats.data["transfer_duration"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine_cls", "extra_config", "expect_async"),
+    [
+        (FakeMooncakeWrapper, None, False),
+        (FakeAsyncMooncakeWrapper, {"mooncake_async_transfer": False}, False),
+        (FakeAsyncMooncakeWrapper, None, True),
+    ],
+    ids=["engine_without_async_api", "async_disabled", "async_default"],
+)
+async def test_async_transfer_falls_back_to_sync_executor(
+    engine_cls, extra_config, expect_async: bool
+):
+    """Without the async API or with the flag off, transfers keep going
+    through batch_transfer_sync_write on the num_workers thread pool."""
+
+    with _producer_worker(engine_cls, extra_config) as worker:
+        assert worker.use_async_transfer is expect_async
+        expected_workers = 1 if expect_async else worker.num_sender_workers
+        assert worker._sender_executor._max_workers == expected_workers
+
+        with patch.object(
+            worker.engine, "batch_transfer_sync_write", return_value=0
+        ) as sync_write:
+            response = await _send_one_request(worker)
+
+        assert response.ok_reqs == ["d-req-async"]
+        assert sync_write.called is not expect_async
+        assert len(worker.xfer_stats.data["transfer_duration"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_transfer_respects_inflight_cap():
+    """At most num_workers batches are submitted before one completes."""
+
+    with _producer_worker(FakeAsyncMooncakeWrapper, {"num_workers": 2}) as worker:
+        engine = worker.engine
+        engine.gates = {batch_id: threading.Event() for batch_id in (1, 2, 3)}
+        tasks = [
+            asyncio.create_task(
+                worker._send_blocks_async(
+                    "consumer-host:54321",
+                    [0x1000 + i * _ASYNC_BLOCK_LEN],
+                    [0x2000 + i * _ASYNC_BLOCK_LEN],
+                    [_ASYNC_BLOCK_LEN],
+                )
+            )
+            for i in range(3)
+        ]
+
+        await _wait_until(lambda: len(engine.submitted) == 2)
+        await asyncio.sleep(0.05)
+        assert len(engine.submitted) == 2
+
+        engine.gates[1].set()
+        await _wait_until(lambda: len(engine.submitted) == 3)
+        engine.gates[2].set()
+        engine.gates[3].set()
+
+        assert await asyncio.gather(*tasks) == [0, 0, 0]
+        assert engine.status_calls == [[1], [2], [3]]
+        assert len(worker.xfer_stats.data["transfer_duration"]) == 3

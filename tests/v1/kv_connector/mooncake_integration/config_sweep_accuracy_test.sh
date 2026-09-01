@@ -38,6 +38,21 @@ run_tests() {
   echo "✅ All ${label} tests passed!"
 }
 
+# Whether the installed Mooncake wheel ships the io_uring backend of the tcp
+# transport (mooncake.engine.SUPPORT_IOURING_TCP; a missing attribute means
+# unsupported).
+supports_iouring_tcp() {
+  python3 - <<'EOF'
+import sys
+
+try:
+    import mooncake.engine as engine
+except ImportError:
+    sys.exit(1)
+sys.exit(0 if getattr(engine, "SUPPORT_IOURING_TCP", False) else 1)
+EOF
+}
+
 # Set backend
 label="default backend"
 cmdline_args=""
@@ -51,3 +66,14 @@ fi
 
 # Run tests
 run_tests "${label}" "${cmdline_args}"
+
+# tcp transport with the io_uring data plane (the plain-Ethernet path). Only
+# the TP=1 pair runs to stay within the job's time budget.
+if supports_iouring_tcp; then
+  configs=("${tp_configs[0]}")
+  export MOONCAKE_EXTRA_CONFIG='"mooncake_protocol":"tcp","mooncake_env":{"MC_FORCE_TCP":"1","MC_TCP_IO_BACKEND":"io_uring"}'
+  run_tests "${label}, tcp + io_uring" "${cmdline_args}"
+  unset MOONCAKE_EXTRA_CONFIG
+else
+  echo "mooncake.engine.SUPPORT_IOURING_TCP is unavailable; skipping the tcp + io_uring sweep"
+fi

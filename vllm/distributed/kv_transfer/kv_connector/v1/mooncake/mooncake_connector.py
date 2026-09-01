@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -354,6 +355,43 @@ def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     return None
 
 
+def _apply_mooncake_env(mooncake_env: Any) -> None:
+    """Export ``kv_connector_extra_config.mooncake_env`` before engine init.
+
+    Mooncake reads its ``MC_*`` knobs from the process environment when the
+    engine is constructed and initialized. Variables that are already set win,
+    so a launcher-provided value still overrides the config.
+    """
+    if not mooncake_env:
+        return
+    if not isinstance(mooncake_env, dict):
+        raise ValueError(
+            "kv_connector_extra_config.mooncake_env must be a dict of "
+            f"environment variables, got {type(mooncake_env).__name__}."
+        )
+    applied: list[str] = []
+    kept: list[str] = []
+    for key, value in mooncake_env.items():
+        if (
+            not isinstance(key, str)
+            or isinstance(value, bool)
+            or not isinstance(value, (str, int))
+        ):
+            raise ValueError(
+                "kv_connector_extra_config.mooncake_env entries must map a "
+                f"str name to a str or int value, got {key!r}={value!r}."
+            )
+        value = str(value)
+        if os.environ.setdefault(key, value) == value:
+            applied.append(f"{key}={value}")
+        else:
+            kept.append(f"{key}={os.environ[key]}")
+    if applied:
+        logger.info("Applied mooncake_env: %s", ", ".join(applied))
+    if kept:
+        logger.info("Kept environment values over mooncake_env: %s", ", ".join(kept))
+
+
 class MooncakeXferMetadata(
     msgspec.Struct,
     omit_defaults=True,  # type: ignore[call-arg]
@@ -575,8 +613,8 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return worker-local transfer stats since the last call.
 
-        Note the P/D asymmetry: because Mooncake is P-push (P calls
-        batch_transfer_sync_write), P records successful transfer latency,
+        Note the P/D asymmetry: because Mooncake is P-push (P submits the
+        batch writes), P records successful transfer latency,
         bytes, and descriptor counts, while D only records failures
         (recv/ZMQ errors). Aggregated NIXL-style dashboards will find
         successful-transfer metrics on the P worker, not D.
@@ -896,10 +934,12 @@ class MooncakeConnectorWorker:
         self.device_id = torch.accelerator.current_device_index()
         current_platform.set_device(self.device_id)
 
+        assert (kv_transfer_config := vllm_config.kv_transfer_config)
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        _apply_mooncake_env(extra_config.get("mooncake_env"))
         self.engine = TransferEngine()
         self.hostname = get_ip()
 
-        assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
@@ -909,6 +949,14 @@ class MooncakeConnectorWorker:
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
         self.num_sender_tasks = self.num_sender_workers * 2
+        # Submit/poll transfers need the async batch API of the installed
+        # Mooncake wheel; otherwise fall back to the blocking thread pool.
+        self.use_async_transfer = bool(
+            extra_config.get("mooncake_async_transfer", True)
+        ) and all(
+            hasattr(self.engine, name)
+            for name in ("batch_transfer_async_write", "get_batch_transfer_status")
+        )
         protocol = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
             "mooncake_protocol", "rdma"
         )
@@ -961,13 +1009,19 @@ class MooncakeConnectorWorker:
             # Background threads for sending kvcaches to D.
             # Each pool thread must be bound to the correct CUDA device
             # because CUDA device selection is thread-local.
+            # With async transfers the loop thread submits batches and this
+            # pool shrinks to one poller thread that waits for completions;
+            # num_workers then caps the batches in flight instead.
             self._sender_executor = ThreadPoolExecutor(
-                max_workers=self.num_sender_workers,
+                max_workers=1 if self.use_async_transfer else self.num_sender_workers,
                 thread_name_prefix="vllm-mooncake-sender",
                 initializer=self._bind_sender_thread_device,
             )
-            logger.debug(
-                "Mooncake Prefiller: use %d workers to send kvcaches",
+            self._inflight_batches = asyncio.Semaphore(self.num_sender_workers)
+            self._sender_loop_device_bound = False
+            logger.info(
+                "Mooncake Prefiller: %s transfers with at most %d in flight",
+                "async submit/poll" if self.use_async_transfer else "sync",
                 self.num_sender_workers,
             )
             # An asyncio queue to buffer incoming requests for the sender
@@ -1320,14 +1374,19 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
-                    src_ptrs,
-                    dst_ptrs,
-                    lengths,
-                )
+                if self.use_async_transfer:
+                    ret_value = await self._send_blocks_async(
+                        remote_session, src_ptrs, dst_ptrs, lengths
+                    )
+                else:
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                    )
 
                 if ret_value != 0:
                     transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
@@ -1596,9 +1655,10 @@ class MooncakeConnectorWorker:
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
     def _bind_sender_thread_device(self) -> None:
-        """ThreadPoolExecutor initializer — binds each pool thread to the
-        correct CUDA device.  CUDA device selection is thread-local, so
-        without this, NVLink transfers fail for TP ranks > 0."""
+        """Bind the calling thread (pool initializer, or the sender loop
+        thread before its first async submit) to the correct CUDA device.
+        CUDA device selection is thread-local, so without this, NVLink
+        transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
 
     def _send_blocks(
@@ -1613,6 +1673,57 @@ class MooncakeConnectorWorker:
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
+        self._record_transfer_result(
+            remote_session, ret_value, duration, src_ptrs, lengths
+        )
+        return ret_value
+
+    async def _send_blocks_async(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        """Submit one batch on the sender loop and await its completion.
+
+        ``batch_transfer_async_write`` returns a batch id, or 0 on failure.
+        ``get_batch_transfer_status`` blocks (GIL released) until every listed
+        batch is terminal, frees the batch ids itself, and returns 0 when all
+        completed or -1 on failure/timeout; it therefore runs on the single
+        poller thread, never on the loop. Completions are observed in
+        submission order and at most ``num_workers`` batches are in flight.
+        """
+        if not self._sender_loop_device_bound:
+            self._bind_sender_thread_device()
+            self._sender_loop_device_bound = True
+        async with self._inflight_batches:
+            start_time = time.perf_counter()
+            batch_id = self.engine.batch_transfer_async_write(
+                remote_session, src_ptrs, dst_ptrs, lengths
+            )
+            if batch_id == 0:
+                ret_value = -1
+            else:
+                ret_value = await self.sender_loop.run_in_executor(
+                    self._sender_executor,
+                    self.engine.get_batch_transfer_status,
+                    [batch_id],
+                )
+            duration = time.perf_counter() - start_time
+        self._record_transfer_result(
+            remote_session, ret_value, duration, src_ptrs, lengths
+        )
+        return ret_value
+
+    def _record_transfer_result(
+        self,
+        remote_session: str,
+        ret_value: int,
+        duration: float,
+        src_ptrs: list[int],
+        lengths: list[int],
+    ) -> None:
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
@@ -1630,7 +1741,6 @@ class MooncakeConnectorWorker:
                 len(src_ptrs),
                 sum(lengths),
             )
-        return ret_value
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
