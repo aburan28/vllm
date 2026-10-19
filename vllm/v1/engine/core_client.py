@@ -182,6 +182,9 @@ class EngineCoreClient(ABC):
     def get_weight_version(self) -> str:
         raise NotImplementedError
 
+    def update_scheduler_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
     async def execute_dummy_batch_async(self) -> None:
         raise NotImplementedError
 
@@ -189,6 +192,11 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def get_weight_version_async(self) -> str:
+        raise NotImplementedError
+
+    async def update_scheduler_config_async(
+        self, overrides: dict[str, Any]
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     def abort_requests(self, request_ids: list[str]) -> None:
@@ -371,6 +379,9 @@ class InprocClient(EngineCoreClient):
 
     def get_weight_version(self) -> str:
         return self.engine_core.get_weight_version()
+
+    def update_scheduler_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        return self.engine_core.update_scheduler_config(overrides)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.engine_core.add_lora(lora_request)
@@ -960,6 +971,9 @@ class SyncMPClient(MPClient):
     def get_weight_version(self) -> str:
         return self.call_utility("get_weight_version")
 
+    def update_scheduler_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        return self.call_utility("update_scheduler_config", overrides)
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -1201,6 +1215,11 @@ class AsyncMPClient(MPClient):
 
     async def get_weight_version_async(self) -> str:
         return await self.call_utility_async("get_weight_version")
+
+    async def update_scheduler_config_async(
+        self, overrides: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self.call_utility_async("update_scheduler_config", overrides)
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         return await self.call_utility_async("add_lora", lora_request)

@@ -3,7 +3,7 @@
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 
@@ -203,6 +203,10 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def set_pause_state(self, pause_state: PauseState) -> None:
+        raise NotImplementedError
+
+    def update_config(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Hot-update allowlisted scheduler config fields at runtime."""
         raise NotImplementedError
 
     @abstractmethod

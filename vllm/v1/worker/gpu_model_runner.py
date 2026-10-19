@@ -77,6 +77,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
+    resolve_touched_modules,
 )
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
@@ -265,6 +266,94 @@ def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     if isinstance(module, BaseLayerWithLoRA):
         module = module.base_layer
     return module.get_parameter(parameter_name)
+
+
+def _reload_weights_partial(
+    runner: "GPUModelRunner",
+    weights_iterator: Iterable[tuple[str, torch.Tensor]] | None,
+    weights_path: str | None,
+    weight_name_prefixes: list[str],
+) -> None:
+    """
+    Reload a subset of weights in place without a full model reload.
+
+    Only the modules touched by the selected weights are bracketed for
+    layerwise reloading and re-processed; every other module is left
+    untouched. Copies land in the original tensor storage, so CUDA graphs and
+    compiled artifacts remain valid.
+
+    Layers are the atomic unit: a bracketed layer either receives its complete
+    checkpoint weight set and is committed, or is rolled back to its previous
+    weights and reported via ValueError. Callers must supply every checkpoint
+    weight of a layer they update (e.g. all of q/k/v for a fused attention
+    layer, and all local experts of a fused MoE layer).
+    """
+    model = runner.get_model()
+    counter_before_reloading = time.perf_counter()
+
+    if weights_iterator is None:
+        model_loader = get_model_loader(runner.load_config)
+        if not hasattr(model_loader, "get_all_weights"):
+            raise NotImplementedError(
+                f"Model reloading with `{runner.load_config.load_format}` format"
+            )
+
+        model_config = runner.model_config
+        if weights_path is not None:
+            # Unlike a full reload, a partial reload does not repoint the
+            # engine at the delta checkpoint, so use a scoped config copy.
+            model_config = copy(runner.model_config)
+            model_config.model = weights_path
+            model_config.revision = None
+        weights_iterator = model_loader.get_all_weights(model_config, model)
+        weights_iterator = cast(Iterable[tuple[str, torch.Tensor]], weights_iterator)
+
+    prefixes = tuple(weight_name_prefixes)
+    weights = [
+        (name, weight) for name, weight in weights_iterator if name.startswith(prefixes)
+    ]
+    if not weights:
+        raise ValueError(
+            f"No checkpoint weights matched prefixes {weight_name_prefixes}"
+        )
+
+    touched_modules = resolve_touched_modules(model, (name for name, _ in weights))
+    logger.info(
+        "Partially reloading %d weights across %d modules inplace...",
+        len(weights),
+        len(touched_modules),
+    )
+
+    initialize_layerwise_reload(model, modules=touched_modules)
+    try:
+        model.load_weights(iter(weights))
+    finally:
+        # Always finalize so complete layers commit and incomplete ones roll
+        # back, leaving the model consistent even if loading raised. The
+        # resets run here too: committed layers must not pair with stale
+        # LoRA state or cached encoder outputs.
+        rolled_back = finalize_layerwise_reload(
+            model, runner.model_config, modules=touched_modules, partial=True
+        )
+        runner.reset_lora_state()
+        runner.reset_encoder_cache()
+        runner.reset_mm_cache()
+
+    diff_seconds = time.perf_counter() - counter_before_reloading
+    logger.info("Partial weight reload and processing took %.2f seconds", diff_seconds)
+
+    if rolled_back:
+        module_names = {id(m): n for n, m in model.named_modules()}
+        rolled_back_names = sorted(
+            module_names.get(id(module), module.__class__.__name__)
+            for module in rolled_back
+        )
+        raise ValueError(
+            "The following layers received an incomplete weight set and were "
+            f"rolled back to their previous weights: {rolled_back_names}. "
+            "All other selected layers were updated. Supply every checkpoint "
+            "weight of a layer (e.g. all of q/k/v) to update it."
+        )
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -5635,6 +5724,7 @@ class GPUModelRunner(
         weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
         weights_path: str | None = None,
         is_checkpoint_format: bool = True,
+        weight_name_prefixes: list[str] | None = None,
     ) -> None:
         """
         Reload weights from a weights iterator or from disk
@@ -5645,7 +5735,25 @@ class GPUModelRunner(
                 provided. Use path of original model if neither is provided.
             is_checkpoint_format: set to False if weights have already been
                 processed into kernel format (repacking, renaming, etc.)
+            weight_name_prefixes: if provided, perform a partial reload: only
+                weights whose checkpoint name starts with one of the prefixes
+                are loaded, and only the modules they touch are re-processed,
+                in place. `weights_path` may point to a delta checkpoint
+                holding just the changed tensors (pass `[""]` to load all of
+                it). Unlike a full reload, the engine's model path is left
+                unchanged. See `_reload_weights_partial` for the semantics of
+                incomplete layers.
         """
+        if weight_name_prefixes is not None:
+            if not is_checkpoint_format:
+                raise ValueError("Partial reloads require weights in checkpoint format")
+            # Module-level function so the MRV2 unbound-method delegation of
+            # `reload_weights` keeps working with a non-subclass runner.
+            _reload_weights_partial(
+                self, weights_iterator, weights_path, weight_name_prefixes
+            )
+            return
+
         # TODO(@kylesayrs): generalize to all runners and loaders
         # argument validation
         if weights_iterator is None and not is_checkpoint_format:

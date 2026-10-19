@@ -6134,3 +6134,62 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+def test_update_config_hot_updates_allowlisted_fields():
+    """Hot updates apply, refresh derived limits, and respect startup bounds."""
+    scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
+
+    applied = scheduler.update_config(
+        {
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 4096,
+            "long_prefill_token_threshold": 2048,
+        }
+    )
+
+    assert applied == {
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 4096,
+        "long_prefill_token_threshold": 2048,
+    }
+    assert scheduler.max_num_running_reqs == 8
+    assert scheduler.max_num_scheduled_tokens == 4096
+    assert scheduler.scheduler_config.long_prefill_token_threshold == 2048
+
+    # Restoring up to the startup value is allowed; exceeding it is not,
+    # since worker-side buffers were sized by the startup values.
+    scheduler.update_config({"max_num_seqs": 16})
+    assert scheduler.max_num_running_reqs == 16
+    with pytest.raises(ValueError, match="startup"):
+        scheduler.update_config({"max_num_seqs": 17})
+    with pytest.raises(ValueError, match="Cannot hot-update"):
+        scheduler.update_config({"max_model_len": 1024})
+    with pytest.raises(ValueError, match="integer"):
+        scheduler.update_config({"max_num_seqs": True})
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        scheduler.update_config({"max_num_batched_tokens": 8})
+    with pytest.raises(ValueError, match="max_model_len"):
+        scheduler.update_config({"long_prefill_token_threshold": 10**9})
+    assert scheduler.max_num_running_reqs == 16
+
+    # An explicit max_num_scheduled_tokens keeps overriding the batch limit.
+    scheduler.scheduler_config.max_num_scheduled_tokens = 2048
+    scheduler.update_config({"max_num_batched_tokens": 8192})
+    assert scheduler.max_num_scheduled_tokens == 2048
+
+
+def test_update_config_guards_unschedulable_prompts():
+    """Without chunked prefill, the batch limit cannot drop below the model
+    length, or long prompts could never be scheduled."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=4096,
+        enable_chunked_prefill=False,
+    )
+
+    with pytest.raises(ValueError, match="chunked"):
+        scheduler.update_config({"max_num_batched_tokens": 2048})
+
+    applied = scheduler.update_config({"max_num_batched_tokens": 4096})
+    assert applied == {"max_num_batched_tokens": 4096}

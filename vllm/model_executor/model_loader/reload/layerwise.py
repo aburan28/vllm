@@ -81,7 +81,10 @@ def record_metadata_for_reloading(model: torch.nn.Module):
 
 
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(
+    model: torch.nn.Module,
+    modules: set[torch.nn.Module] | None = None,
+):
     """
     Set up layerwise weight loading with deferred processing.
 
@@ -95,12 +98,22 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     2. Load all cached weights
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
+
+    Args:
+        model: model to set up for reloading
+        modules: if provided, only bracket these modules for reloading;
+            modules outside the set are left untouched and must not receive
+            weights. Used for partial reloads, resolve the set with
+            `resolve_touched_modules`.
     """
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
 
     for layer in model.modules():
+        if modules is not None and layer not in modules:
+            continue
+
         info = get_layerwise_info(layer)
 
         # Skip if the layer has already been initialized
@@ -185,8 +198,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
 
         # Buffer loaded weights, track loading progress
         info.loaded_weights.append((param_name, bound_args))
-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        num_loaded, num_filled, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
+        info.load_numel_filled += num_filled
 
         logger.debug(
             "%s: %d / %d",
@@ -225,7 +239,12 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
     return online_process_loader
 
 
-def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelConfig):
+def finalize_layerwise_processing(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+    modules: set[torch.nn.Module] | None = None,
+    partial: bool = False,
+) -> list[torch.nn.Module]:
     """
     Apply processing to any layers which were not layerwise processed during loading.
     This includes attention layers and layers which have weight elements which are not
@@ -237,13 +256,28 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     Args:
         model: model to finalize processing for
         model_config: config needed for applying processing to attention layers
+        modules: if provided, only finalize these modules; must match the set
+            passed to `initialize_layerwise_reload`
+        partial: set to True when reloading a subset of weights. Bracketed
+            layers which received no weights are restored silently, and layers
+            which received only some of their weights are rolled back to their
+            previous weights instead of being processed with partially
+            uninitialized data.
+
+    Returns:
+        layers rolled back because they received an incomplete weight set
+        (always empty when `partial` is False)
     """
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
+    rolled_back: list[torch.nn.Module] = []
 
     for layer in model.modules():
+        if modules is not None and layer not in modules:
+            continue
+
         info = get_layerwise_info(layer)
         if not info.can_load():
             info.reset()
@@ -264,7 +298,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
             # reloading: place kernel tensors back as a fallback. Always place, even
             # when nothing is loadable (load_numel_total == 0), so parameter-alias
             # buffers on such layers are restored rather than left deleted.
-            if info.load_numel_total > 0:  # type: ignore[operator]
+            # In partial mode receiving no weights is expected, so stay silent.
+            if info.load_numel_total > 0 and not partial:  # type: ignore[operator]
                 logger.warning("%s: Failed to load weights", layer.__class__.__name__)
             _place_kernel_tensors(layer, info)
 
@@ -273,8 +308,26 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         # Having too many of these delayed layers can lead to excess memory usage
         # see Limitations(4)
         elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
-            logger.debug("%s: Delayed processing", layer.__class__.__name__)
-            _layerwise_process(layer, info)
+            # Filled elements (e.g. zeroed vocab padding) count toward
+            # completeness: a padded-but-complete layer commits.
+            if partial and (
+                info.load_numel + info.load_numel_filled < info.load_numel_total  # type: ignore[operator]
+            ):
+                # Processing here would commit partially uninitialized data, so
+                # restore the layer's previous weights instead. Layers are the
+                # atomic unit of a partial reload: supply every checkpoint
+                # weight of a layer (e.g. all of q/k/v) to update it.
+                logger.warning(
+                    "%s: rolled back partial weight update (%d/%d elements loaded)",
+                    layer.__class__.__name__,
+                    info.load_numel,
+                    info.load_numel_total,
+                )
+                _place_kernel_tensors(layer, info)
+                rolled_back.append(layer)
+            else:
+                logger.debug("%s: Delayed processing", layer.__class__.__name__)
+                _layerwise_process(layer, info)
 
         info.reset()
 
@@ -284,10 +337,11 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+    return rolled_back
 
 
 def finalize_layerwise_reload(*args, **kwargs):
-    finalize_layerwise_processing(*args, **kwargs)
+    return finalize_layerwise_processing(*args, **kwargs)
 
 
 def _finalize_attention_layer(

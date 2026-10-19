@@ -1182,3 +1182,55 @@ class AsyncLLM(EngineClient):
     async def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
         return await self.engine_core.get_weight_version_async()
+
+    async def update_engine_args(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """
+        Hot-update allowlisted engine args at runtime.
+
+        Currently covers scheduler knobs (`max_num_seqs`,
+        `max_num_batched_tokens`, `long_prefill_token_threshold`); capacity
+        fields may only be lowered or restored, never raised past their
+        startup values.
+
+        Returns:
+            the applied fields and their effective values
+
+        Raises:
+            ValueError: on an unknown field or an invalid value; nothing is
+                applied in that case.
+        """
+        result = await self.engine_core.update_scheduler_config_async(overrides)
+        if "error" in result:
+            raise ValueError(result["error"])
+        return result["applied"]
+
+    async def reload_weights(
+        self,
+        weights_path: str | None = None,
+        weight_name_prefixes: list[str] | None = None,
+        weight_version: str | None = None,
+    ) -> None:
+        """
+        Reload model weights in place from disk without restarting the engine.
+
+        Args:
+            weights_path: checkpoint to load from; defaults to the engine's
+                current model path. For a partial reload this may be a delta
+                checkpoint holding just the changed tensors.
+            weight_name_prefixes: if provided, perform a partial reload of
+                only the weights whose checkpoint name starts with one of the
+                prefixes (pass `[""]` to load every tensor found at
+                `weights_path`); only the touched modules are re-processed.
+                If None, all weights are reloaded.
+            weight_version: weight version to set after a successful reload.
+        """
+        kwargs: dict[str, Any] = {}
+        if weights_path is not None:
+            kwargs["weights_path"] = weights_path
+        if weight_name_prefixes is not None:
+            kwargs["weight_name_prefixes"] = weight_name_prefixes
+        await self.collective_rpc("reload_weights", kwargs=kwargs)
+        # Cached prefix KV was computed with the old weights.
+        await self.reset_prefix_cache()
+        if weight_version is not None:
+            await self.update_weight_version(weight_version)

@@ -156,7 +156,8 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
 
 class CopyCounter(TorchDispatchMode):
     """
-    Tracks total number of elements modified with `copy_`.
+    Tracks total number of elements modified with `copy_`, and separately the
+    elements written with `fill_` (padding regions, e.g. vocab padding).
 
     Useful for keeping track of weight loading where underlying weights can be
     arbitrarily transformed (such as with `narrow`) before calling copy.
@@ -167,6 +168,7 @@ class CopyCounter(TorchDispatchMode):
     def __init__(self):
         super().__init__()
         self.copied_numel = 0
+        self.filled_numel = 0
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -175,13 +177,15 @@ class CopyCounter(TorchDispatchMode):
         if func is torch.ops.aten.copy_.default:
             assert args[0].numel() == args[1].numel()
             self.copied_numel += args[0].numel()
+        elif func in (torch.ops.aten.fill_.Scalar, torch.ops.aten.fill_.Tensor):
+            self.filled_numel += args[0].numel()
 
         return func(*args, **kwargs)
 
 
 def get_numel_loaded(
     weight_loader: Callable, args: inspect.BoundArguments
-) -> tuple[int, object]:
+) -> tuple[int, int, object]:
     """
     Determine how many elements would be loaded by a weight loader call.
 
@@ -190,8 +194,10 @@ def get_numel_loaded(
         args: bound arguments to weight loader
 
     Returns:
-        number of elements loaded by the weight loader, the return value of the
-        weight loader
+        number of elements copied by the weight loader, number of additional
+        elements it filled (e.g. vocab padding, so partial reloads can tell a
+        padded-but-complete parameter from an incomplete one), and the return
+        value of the weight loader
     """
     with CopyCounter() as counter:
         return_value = weight_loader(*args.args, **args.kwargs)
@@ -204,9 +210,12 @@ def get_numel_loaded(
     # size. Over-counting inflates the layer's loaded-element total and can
     # finalize the layer before every parameter is loaded, silently dropping
     # the trailing parameter(s) (e.g. Mamba ``mixer.D``). Cap the count at the
-    # destination size to keep the per-layer accounting correct.
+    # destination size to keep the per-layer accounting correct. Filled
+    # elements are capped at the remaining gap for the same reason.
     numel = counter.copied_numel
+    filled = counter.filled_numel
     param = args.arguments.get("param", None)
     if isinstance(param, torch.Tensor):
         numel = min(numel, param.numel())
-    return numel, return_value
+        filled = min(filled, max(param.numel() - numel, 0))
+    return numel, filled, return_value
