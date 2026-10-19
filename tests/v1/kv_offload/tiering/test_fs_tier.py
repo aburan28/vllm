@@ -8,6 +8,7 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import logging
 import mmap
 import os
 import threading
@@ -18,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.v1.kv_offload.fake_uring import install_fake_uring, make_fake_uring
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -37,6 +39,7 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs.io import batch_load_block
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
@@ -969,3 +972,99 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# io_uring backend (mooncake.uring)
+# ---------------------------------------------------------------------------
+
+
+def _make_tier(tmp_path, tensor: torch.Tensor) -> FileSystemTierManager:
+    return FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+
+
+def test_uring_backend_round_trips_through_mooncake_uring(tmp_path, monkeypatch):
+    """VLLM_KV_OFFLOAD_DISK_IO_BACKEND=io_uring routes block I/O through
+    mooncake.uring, registers the KV buffer once and unregisters on shutdown."""
+    fake = make_fake_uring()
+    install_fake_uring(monkeypatch, fake)
+    tensor = _page_aligned_rand_tensor(4, _BLOCK_ELEMENTS)
+    block_bytes = _BLOCK_ELEMENTS * tensor.element_size()
+    tier = _make_tier(tmp_path, tensor)
+    try:
+        assert tier._uring is fake
+        assert fake.registered == [(tensor.data_ptr(), tensor.nbytes)]
+
+        keys = [key(0), key(1)]
+        expected = tensor[:2].clone()
+        tier.submit_store(make_job(1, keys, [0, 1]))
+        assert all(r.success for r in drain(tier))
+
+        tensor[:2] = 0.0
+        tier.submit_load(make_job(2, keys, [2, 3], is_promotion=True))
+        assert all(r.success for r in drain(tier))
+        for i, bid in enumerate([2, 3]):
+            assert torch.allclose(tensor[bid], expected[i])
+
+        assert [(kind, length) for kind, _, _, length, _ in fake.calls] == (
+            [("write", block_bytes)] * 2 + [("read", block_bytes)] * 2
+        )
+        assert all(f.closed for f in fake.files)
+        assert {f.direct_io for f in fake.files} == {tier._use_o_direct}
+    finally:
+        tier.shutdown()
+    assert fake.unregister_calls == 1
+
+
+@pytest.mark.parametrize("reason", ["missing_module", "no_support"])
+def test_uring_backend_falls_back_to_posix(tmp_path, monkeypatch, caplog_vllm, reason):
+    """An unusable mooncake.uring keeps the POSIX path with one warning."""
+    module = None if reason == "missing_module" else make_fake_uring(support=False)
+    install_fake_uring(monkeypatch, module)
+    tensor = _page_aligned_rand_tensor(2, _BLOCK_ELEMENTS)
+
+    with caplog_vllm.at_level(logging.WARNING):
+        tier = _make_tier(tmp_path, tensor)
+    try:
+        assert tier._uring is None
+        assert "falling back to POSIX I/O" in caplog_vllm.text
+
+        expected = tensor[0].clone()
+        tier.submit_store(make_job(1, [key(0)], [0]))
+        assert all(r.success for r in drain(tier))
+        tensor[0] = 0.0
+        tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+        assert all(r.success for r in drain(tier))
+        assert torch.allclose(tensor[1], expected)
+    finally:
+        tier.shutdown()
+
+
+def test_uring_short_read_removes_file_and_reports_progress(tmp_path, monkeypatch):
+    """The delete-on-short-read policy and num_succeeded hold on io_uring."""
+    fake = make_fake_uring()
+    install_fake_uring(monkeypatch, fake)
+    tensor = _page_aligned_zero_tensor(2, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    block_bytes = _BLOCK_ELEMENTS * tensor.element_size()
+    good = tmp_path / "good.bin"
+    good.write_bytes(b"\x01" * block_bytes)
+    short = tmp_path / "short.bin"
+    short.write_bytes(b"\x02" * (block_bytes // 2))
+
+    with pytest.raises(OSError, match="Short read") as excinfo:
+        batch_load_block(
+            [str(good), str(short)], view, [0, block_bytes], block_bytes, False, fake
+        )
+
+    assert excinfo.value.num_succeeded == 1
+    assert good.exists()
+    assert not short.exists()
+    assert bytes(view.cast("B")[:block_bytes]) == b"\x01" * block_bytes

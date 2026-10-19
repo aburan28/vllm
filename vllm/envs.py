@@ -302,6 +302,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
+    VLLM_KV_OFFLOAD_DISK_IO_BACKEND: Literal["posix", "io_uring"] = "posix"
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
@@ -2062,6 +2063,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocm 7.14/7.15 when batch copy is optimized; CUDA uncapped). Set >0 to override.
     "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS": lambda: int(
         os.getenv("VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS", "0")
+    ),
+    # File I/O backend for the disk KV offload tiers (simple KV offload disk
+    # mode and the tiering "fs" tier). "io_uring" issues the block reads and
+    # writes through mooncake.uring (registered buffers, batched submission)
+    # and falls back to "posix" with a warning when that module is missing,
+    # reports no io_uring support, or the kernel/seccomp rejects io_uring.
+    "VLLM_KV_OFFLOAD_DISK_IO_BACKEND": env_with_choices(
+        "VLLM_KV_OFFLOAD_DISK_IO_BACKEND", "posix", ["posix", "io_uring"]
     ),
     # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
     # supported but disabled by default due to a small performance regression.
